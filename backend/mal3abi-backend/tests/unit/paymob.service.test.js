@@ -1,0 +1,342 @@
+import { jest } from "@jest/globals";
+import crypto from "crypto";
+import {
+  verifyTransactionHmac,
+  createPaymentIntention,
+  inquireTransaction,
+  inquireLatestTransactionByOrder,
+  getPaymobAuthToken,
+  registerPaymobOrder,
+  generateWalletPaymentKey,
+  executeWalletPayment,
+} from "../../src/modules/payments/paymob.service.js";
+
+describe("Paymob Service - Unit Tests (Phase 5)", () => {
+  const secretKey = "egy_sk_test_mock_secret_key";
+  const publicKey = "egy_pk_test_mock_public_key";
+  const hmacSecret = "TEST_HMAC_SECRET_1234567890ABCDEF";
+  const apiKey = "TEST_API_KEY_MOCK";
+
+  beforeEach(() => {
+    process.env.PAYMOB_SECRET_KEY = secretKey;
+    process.env.PAYMOB_PUBLIC_KEY = publicKey;
+    process.env.PAYMOB_HMAC_SECRET = hmacSecret;
+    process.env.PAYMOB_API_KEY = apiKey;
+    process.env.PAYMOB_BASE_URL = "https://accept.paymob.com";
+    process.env.PAYMOB_INTEGRATION_ID_CARD = "5835543";
+    process.env.PAYMOB_INTEGRATION_ID_WALLET = "5835572";
+  });
+
+  describe("HMAC SHA-512 Verification (20 Canonical Fields)", () => {
+    const sampleObj = {
+      amount_cents: 20000,
+      created_at: "2026-08-14T20:00:00.000000",
+      currency: "EGP",
+      error_occured: false,
+      has_parent_transaction: false,
+      id: 515460807,
+      integration_id: 5835543,
+      is_3d_secure: true,
+      is_auth: false,
+      is_capture: false,
+      is_refunded: false,
+      is_standalone_payment: true,
+      is_voided: false,
+      order: { id: 587505945 },
+      owner: 2428940,
+      pending: false,
+      source_data: {
+        pan: "2346",
+        sub_type: "MasterCard",
+        type: "card",
+      },
+      success: true,
+    };
+
+    function calculateHmac(obj, secret) {
+      const fields = [
+        obj.amount_cents,
+        obj.created_at,
+        obj.currency,
+        obj.error_occured,
+        obj.has_parent_transaction,
+        obj.id,
+        obj.integration_id,
+        obj.is_3d_secure,
+        obj.is_auth,
+        obj.is_capture,
+        obj.is_refunded,
+        obj.is_standalone_payment,
+        obj.is_voided,
+        obj.order?.id,
+        obj.owner,
+        obj.pending,
+        obj.source_data?.pan,
+        obj.source_data?.sub_type,
+        obj.source_data?.type,
+        obj.success,
+      ];
+      const concatenated = fields.map((v) => (v !== undefined && v !== null ? String(v) : "")).join("");
+      return crypto.createHmac("sha512", secret).update(concatenated).digest("hex").toLowerCase();
+    }
+
+    it("should return true for a correctly signed callback", () => {
+      const validHmac = calculateHmac(sampleObj, hmacSecret);
+      expect(verifyTransactionHmac(sampleObj, validHmac)).toBe(true);
+    });
+
+    it("ignores accidental surrounding whitespace in the configured HMAC secret", () => {
+      const validHmac = calculateHmac(sampleObj, hmacSecret);
+      process.env.PAYMOB_HMAC_SECRET = `  ${hmacSecret}  `;
+      expect(verifyTransactionHmac(sampleObj, validHmac)).toBe(true);
+    });
+
+    it("should return true when HMAC is in uppercase (case-insensitive)", () => {
+      const validHmacUpper = calculateHmac(sampleObj, hmacSecret).toUpperCase();
+      expect(verifyTransactionHmac(sampleObj, validHmacUpper)).toBe(true);
+    });
+
+    it("should return false if amount_cents is tampered", () => {
+      const validHmac = calculateHmac(sampleObj, hmacSecret);
+      const tampered = { ...sampleObj, amount_cents: 10000 };
+      expect(verifyTransactionHmac(tampered, validHmac)).toBe(false);
+    });
+
+    it("should return false if success status is tampered", () => {
+      const validHmac = calculateHmac(sampleObj, hmacSecret);
+      const tampered = { ...sampleObj, success: false };
+      expect(verifyTransactionHmac(tampered, validHmac)).toBe(false);
+    });
+
+    it("should return false if order id is tampered", () => {
+      const validHmac = calculateHmac(sampleObj, hmacSecret);
+      const tampered = { ...sampleObj, order: { id: 9999999 } };
+      expect(verifyTransactionHmac(tampered, validHmac)).toBe(false);
+    });
+
+    it("should return false if secret is incorrect", () => {
+      const wrongSecretHmac = calculateHmac(sampleObj, "WRONG_SECRET");
+      expect(verifyTransactionHmac(sampleObj, wrongSecretHmac)).toBe(false);
+    });
+
+    it("should return false if obj or hmac is null/undefined", () => {
+      expect(verifyTransactionHmac(null, "some_hmac")).toBe(false);
+      expect(verifyTransactionHmac(sampleObj, null)).toBe(false);
+      expect(verifyTransactionHmac(sampleObj, "")).toBe(false);
+    });
+  });
+
+  describe("Unified Checkout URL Builder", () => {
+    it("should build Unified Checkout URL with accept.paymob.com/unifiedcheckout/", async () => {
+      const mockClientSecret = "egy_csk_test_mock_12345";
+      const originalFetch = global.fetch;
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          id: "pi_test_123",
+          client_secret: mockClientSecret,
+          intention_order_id: 123456,
+        }),
+      });
+
+      const result = await createPaymentIntention({
+        amountCents: 20000,
+        currency: "EGP",
+        specialReference: "booking_123_1723640000000",
+        customer: { firstName: "Test", lastName: "User", email: "test@user.com", phone: "+201000000000" },
+      });
+
+      expect(result.clientSecret).toBe(mockClientSecret);
+      expect(result.checkoutUrl).toBe(
+        `https://accept.paymob.com/unifiedcheckout/?publicKey=${publicKey}&clientSecret=${mockClientSecret}`
+      );
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://accept.paymob.com/v1/intention/",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            Authorization: `Token ${secretKey}`,
+            "Content-Type": "application/json",
+          }),
+        })
+      );
+      const requestPayload = JSON.parse(global.fetch.mock.calls[0][1].body);
+      expect(requestPayload.expiration).toBe(15 * 60);
+      expect(requestPayload.payment_methods).toEqual([5835543, 5835572]);
+
+      global.fetch = originalFetch;
+    });
+  });
+
+  describe("Direct Mobile Wallet Flow (4-Step Sequence)", () => {
+    let originalFetch;
+
+    beforeEach(() => {
+      originalFetch = global.fetch;
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    it("should fetch Paymob Auth Token successfully", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ token: "auth_token_mock_123" }),
+      });
+
+      const token = await getPaymobAuthToken();
+      expect(token).toBe("auth_token_mock_123");
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://accept.paymob.com/api/auth/tokens",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ api_key: apiKey }),
+        })
+      );
+    });
+
+    it("should register Paymob order successfully", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: 987654 }),
+      });
+
+      const orderId = await registerPaymobOrder({
+        authToken: "auth_token_mock_123",
+        amountCents: 15000,
+        merchantOrderId: "booking_123_456",
+        items: [{ name: "Padel Court", amountCents: 15000, quantity: 1 }],
+      });
+
+      expect(orderId).toBe(987654);
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://accept.paymob.com/api/ecommerce/orders",
+        expect.objectContaining({
+          method: "POST",
+        })
+      );
+    });
+
+    it("should generate payment key token for wallet integration", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ token: "payment_key_token_mock_456" }),
+      });
+
+      const keyToken = await generateWalletPaymentKey({
+        authToken: "auth_token_mock_123",
+        amountCents: 15000,
+        orderId: 987654,
+        billingData: {
+          firstName: "Ahmed",
+          lastName: "Ali",
+          email: "ahmed@example.com",
+          phone: "01010101010",
+        },
+      });
+
+      expect(keyToken).toBe("payment_key_token_mock_456");
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://accept.paymob.com/api/acceptance/payment_keys",
+        expect.objectContaining({
+          method: "POST",
+          body: expect.stringContaining("5835572"),
+        })
+      );
+    });
+
+    it("should execute wallet pay request with normalized phone number", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          redirect_url: "https://accept.paymob.com/api/acceptance/post_pay?token=otp_token",
+          pending: true,
+          success: false,
+          id: 112233,
+        }),
+      });
+
+      const result = await executeWalletPayment({
+        paymentKeyToken: "payment_key_token_mock_456",
+        walletMobileNumber: "+201010101010",
+      });
+
+      expect(result.redirectUrl).toContain("post_pay");
+      expect(result.pending).toBe(true);
+      expect(result.transactionId).toBe(112233);
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://accept.paymob.com/api/acceptance/payments/pay",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            source: {
+              identifier: "01010101010",
+              subtype: "WALLET",
+            },
+            payment_token: "payment_key_token_mock_456",
+          }),
+        })
+      );
+    });
+  });
+
+  describe("Transaction inquiry recovery", () => {
+    let originalFetch;
+
+    beforeEach(() => {
+      originalFetch = global.fetch;
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    it("uses a bearer token for transaction-id inquiry", async () => {
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "inquiry_token" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 123, success: true, pending: false }) });
+
+      await expect(inquireTransaction(123)).resolves.toMatchObject({ id: 123, success: true });
+      expect(global.fetch).toHaveBeenNthCalledWith(
+        2,
+        "https://accept.paymob.com/api/acceptance/transactions/123",
+        expect.objectContaining({ headers: { Authorization: "Bearer inquiry_token" } }),
+      );
+    });
+
+    it("finds a payment by Paymob order id when no callback transaction id exists", async () => {
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "inquiry_token" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 456, order: { id: 789 }, success: true, pending: false }) });
+
+      await expect(inquireLatestTransactionByOrder({ orderId: 789 }))
+        .resolves.toMatchObject({ id: 456, order: { id: 789 } });
+      expect(global.fetch).toHaveBeenNthCalledWith(
+        2,
+        "https://accept.paymob.com/api/ecommerce/orders/transaction_inquiry",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ auth_token: "inquiry_token", order_id: "789" }),
+        }),
+      );
+    });
+
+    it("uses merchant_order_id when an order id was never persisted", async () => {
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "inquiry_token" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 457, success: true, pending: false }) });
+
+      await expect(inquireLatestTransactionByOrder({ merchantOrderId: "booking_attempt_123" }))
+        .resolves.toMatchObject({ id: 457 });
+      expect(global.fetch).toHaveBeenNthCalledWith(
+        2,
+        "https://accept.paymob.com/api/ecommerce/orders/transaction_inquiry",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ auth_token: "inquiry_token", merchant_order_id: "booking_attempt_123" }),
+        }),
+      );
+    });
+  });
+});
